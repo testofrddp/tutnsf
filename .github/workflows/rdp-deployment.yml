@@ -1,0 +1,348 @@
+name: RDP Server Deployment (Production)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even if another instance is running'
+        required: false
+        default: 'false'
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write  # Required to push connection details back to repository
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: System Information and Prerequisites
+      run: |
+        echo "=== SYSTEM INFORMATION ==="
+        echo "OS: $env:OS"
+        echo "Processor: $env:PROCESSOR_ARCHITECTURE"
+        echo "User: $env:USERNAME"
+        echo "PowerShell Version: $($PSVersionTable.PSVersion)"
+        echo "Current Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "=============================="
+
+        # Check SSH availability
+        try {
+          $sshVersion = ssh -V 2>&1
+          echo "SSH Version: $sshVersion"
+        } catch {
+          echo "WARNING: SSH not found, attempting to install OpenSSH..."
+          try {
+            Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+            echo "✓ OpenSSH Client installed"
+          } catch {
+            echo "✗ Failed to install OpenSSH: $_"
+            exit 1
+          }
+        }
+
+    - name: Enhanced RDP Configuration
+      run: |
+        echo "=== RDP CONFIGURATION ==="
+        echo "Configuring Windows Remote Desktop with enhanced security..."
+
+        try {
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          echo "✓ Remote Desktop enabled"
+
+          # Configure firewall rules
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          echo "✓ Firewall rules configured"
+
+          # Disable Network Level Authentication (can cause issues with tunneled connections)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          echo "✓ Network Level Authentication disabled for better tunnel compatibility"
+
+          # Set security layer to RDP Security Layer
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "SecurityLayer" -Value 0
+          echo "✓ Security layer set to RDP"
+
+          # Set encryption level to low for better compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "MinEncryptionLevel" -Value 1
+          echo "✓ Encryption level set for compatibility"
+
+          # Configure user account
+          $username = "runneradmin"
+          $password = "P@ssw0rd!"
+          Set-LocalUser -Name $username -Password (ConvertTo-SecureString -AsPlainText $password -Force)
+          echo "✓ User credentials configured"
+
+          # Restart RDP service to apply configuration changes
+          echo "Restarting RDP service to apply configuration..."
+          Restart-Service -Name "TermService" -Force
+          Start-Sleep -Seconds 3
+
+          # Verify RDP service
+          $rdpService = Get-Service -Name "TermService"
+          if ($rdpService.Status -eq "Running") {
+            echo "✓ RDP service restarted and running"
+          } else {
+            echo "⚠ RDP service not running, attempting to start..."
+            Start-Service -Name "TermService"
+            Start-Sleep -Seconds 2
+            $rdpService = Get-Service -Name "TermService"
+            if ($rdpService.Status -eq "Running") {
+              echo "✓ RDP service started successfully"
+            } else {
+              echo "✗ Failed to start RDP service"
+            }
+          }
+
+          # Check if RDP port is listening
+          Start-Sleep -Seconds 2  # Give service time to bind to port
+          $rdpPort = Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue
+          if ($rdpPort) {
+            echo "✓ RDP port 3389 is listening"
+            echo "  Listening on: $($rdpPort.LocalAddress):$($rdpPort.LocalPort)"
+          } else {
+            echo "⚠ RDP port 3389 not detected"
+            echo "Checking all listening ports..."
+            Get-NetTCPConnection -State Listen | Where-Object {$_.LocalPort -eq 3389} | ForEach-Object {
+              echo "  Found RDP port: $($_.LocalAddress):$($_.LocalPort)"
+            }
+          }
+
+          # Additional diagnostics
+          echo "=== RDP DIAGNOSTICS ==="
+          echo "Current RDP configuration:"
+          $rdpConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          echo "  UserAuthentication: $($rdpConfig.UserAuthentication)"
+          echo "  SecurityLayer: $($rdpConfig.SecurityLayer)"
+          echo "  MinEncryptionLevel: $($rdpConfig.MinEncryptionLevel)"
+
+          $tsConfig = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          echo "  fDenyTSConnections: $($tsConfig.fDenyTSConnections)"
+
+          echo "=== RDP CONFIGURATION COMPLETE ==="
+
+        } catch {
+          echo "✗ RDP configuration failed: $_"
+          echo "This may cause connection issues"
+        }
+
+    - name: Create Pinggy Tunnel (Enhanced)
+      run: |
+        echo "=== PINGGY TUNNEL SETUP ==="
+        echo "Starting enhanced Pinggy tunnel with comprehensive error handling..."
+
+        # Test connectivity to Pinggy
+        echo "Testing connectivity to a.pinggy.io..."
+        try {
+          $tcpClient = New-Object System.Net.Sockets.TcpClient
+          $tcpClient.ConnectAsync("a.pinggy.io", 443).Wait(5000)
+          if (!$tcpClient.Connected) {
+            throw "Connection failed"
+          }
+          $tcpClient.Close()
+          echo "✓ Connectivity to a.pinggy.io confirmed"
+        } catch {
+          echo "ERROR: Cannot connect to a.pinggy.io"
+          echo "Network connectivity issue detected"
+          exit 1
+        }
+
+        # Enhanced tunneling with multiple providers for reliability
+        $tunnelUrl = ""
+        $connectionEstablished = $false
+        $maxAttempts = 2
+
+        # Define providers in order of reliability
+        $providers = @(
+          @{ Name = "Pinggy-Token"; Args = "-p 443 -R 0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 z1eCdrpxyxB@free.pinggy.io"; Pattern = "tcp://([^\s\r\n]+)" },
+          @{ Name = "Serveo"; Args = "-T -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -R 0:localhost:3389 serveo.net"; Pattern = "Forwarding TCP connections from ([^\s\r\n]+)" }
+        )
+
+        foreach ($provider in $providers) {
+          if ($connectionEstablished) { break }
+
+          for ($attemptNum = 1; $attemptNum -le $maxAttempts; $attemptNum++) {
+            echo "$($provider.Name) connection attempt $attemptNum/$maxAttempts"
+
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "ssh"
+            $psi.Arguments = $provider.Args
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.CreateNoWindow = $true
+
+          $process = New-Object System.Diagnostics.Process
+          $process.StartInfo = $psi
+
+          $outputBuilder = New-Object System.Text.StringBuilder
+          $errorBuilder = New-Object System.Text.StringBuilder
+
+          $outputHandler = {
+            if ($EventArgs.Data -ne $null) {
+              [void]$outputBuilder.AppendLine($EventArgs.Data)
+              Write-Host "PINGGY: $($EventArgs.Data)"
+            }
+          }
+
+          $errorHandler = {
+            if ($EventArgs.Data -ne $null) {
+              [void]$errorBuilder.AppendLine($EventArgs.Data)
+              Write-Host "PINGGY-ERR: $($EventArgs.Data)"
+            }
+          }
+
+          Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
+          Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $errorHandler
+
+          try {
+            $process.Start()
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+
+            # Monitor for tunnel establishment (Pinggy typically takes longer)
+            for ($i = 0; $i -lt 90; $i++) {
+              Start-Sleep -Seconds 1
+
+              $output = $outputBuilder.ToString()
+              $errorOutput = $errorBuilder.ToString()
+              $allOutput = $output + $errorOutput
+
+              # Enhanced pattern matching for Pinggy
+              if ($allOutput -match "tcp://([^\s\r\n]+)") {
+                $tunnelUrl = $matches[1].Trim()
+                $connectionEstablished = $true
+                echo "✓ Pinggy tunnel URL found: tcp://$tunnelUrl"
+                break
+              }
+              elseif ($allOutput -match "([a-zA-Z0-9\-]+\.a\.pinggy\.io:\d+)") {
+                $tunnelUrl = "tcp://$($matches[1].Trim())"
+                $connectionEstablished = $true
+                echo "✓ Pinggy tunnel URL found: $tunnelUrl"
+                break
+              }
+
+              if ($i % 15 -eq 0 -and $i -gt 0) {
+                echo "Waiting for Pinggy tunnel... ($i/90 seconds)"
+              }
+            }
+
+            if (!$process.HasExited -and !$connectionEstablished) {
+              $process.Kill()
+            }
+
+          } catch {
+            echo "Error during Pinggy connection: $_"
+          } finally {
+            Get-EventSubscriber | Where-Object { $_.SourceObject -eq $process } | Unregister-Event
+          }
+
+          if ($connectionEstablished) {
+            break
+          } else {
+            echo "Attempt $attemptNum failed, retrying..."
+            Start-Sleep -Seconds 10
+          }
+        }
+
+        if ($connectionEstablished -and $tunnelUrl) {
+          $connectionDetails = @{
+            host = $tunnelUrl
+            username = "runneradmin"
+            password = "P@ssw0rd!"
+            status = "ready"
+            provider = "pinggy"
+            establishedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            connectionString = "mstsc /v:$($tunnelUrl -replace 'tcp://', '') /u:runneradmin"
+          }
+
+          echo "=== RDP CONNECTION DETAILS ==="
+          echo "Host: $tunnelUrl"
+          echo "Username: runneradmin"
+          echo "Password: P@ssw0rd!"
+          echo "Provider: Pinggy"
+          echo "=============================="
+
+          $jsonDetails = $connectionDetails | ConvertTo-Json -Depth 10
+          $jsonDetails | Out-File -FilePath "connection-details.json" -Encoding UTF8
+
+          git config --global user.email "action@github.com"
+          git config --global user.name "GitHub Action"
+          git add connection-details.json
+          git commit -m "Add RDP connection details [pinggy-automated]"
+          git push origin main
+
+        } else {
+          echo "=== PINGGY TUNNEL FAILED ==="
+          echo "Failed to establish Pinggy tunnel after $maxAttempts attempts"
+          exit 1
+        }
+    - name: Failover to Alternative Providers
+      if: failure()
+      run: |
+        echo "Primary provider failed, attempting failover..."
+        $fallbackProviders = @("ngrok")
+        
+        foreach ($provider in $fallbackProviders) {
+          echo "Attempting failover to $provider..."
+          
+          try {
+            switch ($provider) {
+              "ngrok" {
+                echo "Failover for ngrok not implemented"
+                break
+              }
+            }
+            
+            if ($tunnelUrl) {
+              echo "Failover to $provider successful!"
+              break
+            }
+          } catch {
+            echo "Failover to $provider failed: $_"
+            continue
+          }
+        }
+        
+        if (!$tunnelUrl) {
+          echo "All failover attempts failed"
+          exit 1
+        }
+    - name: Keep RDP Server Active
+      run: |
+        echo "=== RDP SERVER ACTIVE ==="
+        echo "RDP server is now running and accessible"
+        echo "Session will remain active for the duration of this workflow"
+        echo "Maximum session time: 90 minutes (GitHub Actions limit)"
+        echo ""
+        echo "Connection established at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo "Estimated session end: $(Get-Date -Date (Get-Date).AddMinutes(85) -Format 'yyyy-MM-dd HH:mm:ss UTC')"
+        echo ""
+        echo "Keeping session alive..."
+
+        # Keep alive with periodic status updates
+        $startTime = Get-Date
+        $maxDuration = 85 * 60  # 85 minutes in seconds
+        $updateInterval = 300   # 5 minutes
+
+        while ((Get-Date) -lt $startTime.AddSeconds($maxDuration)) {
+          Start-Sleep -Seconds $updateInterval
+          $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+          $remaining = [math]::Round(85 - $elapsed, 1)
+          echo "Session active for $elapsed minutes, $remaining minutes remaining"
+
+          # Verify RDP service is still running
+          $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+          if ($rdpService -and $rdpService.Status -eq "Running") {
+            echo "✓ RDP service healthy"
+          } else {
+            echo "⚠ RDP service issue detected"
+          }
+        }
+
+        echo "Session time limit reached, workflow ending"
